@@ -6,7 +6,7 @@
 //! reads the server's completion reply. FTP allows a single data connection per session, so the
 //! lock never serializes anything that could have run concurrently before.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,7 +15,7 @@ use super::data_stream::DataStream;
 use super::tls::TlsStream;
 use crate::Status;
 use crate::command::Command;
-use crate::types::{FtpError, FtpResult, Response};
+use crate::types::{FtpError, FtpResult, MAX_REPLY_SIZE, ReplyTooLarge, Response};
 
 /// Replies that complete a data transfer: `226` or `250`.
 pub(super) const TRANSFER_COMPLETE: &[Status] =
@@ -112,7 +112,7 @@ where
     pub(super) fn read_response_in(&mut self, expected_code: &[Status]) -> FtpResult<Response> {
         let mut line = Vec::new();
         let mut body: Vec<u8> = Vec::new();
-        self.read_line(&mut line)?;
+        self.read_line(&mut line, 0)?;
         body.extend(line.iter());
 
         trace!("CC IN: {:?}", line);
@@ -143,7 +143,7 @@ where
         trace!("CC IN: {:?}", line);
         while !is_terminal(&line) {
             line.clear();
-            let bytes_read = self.read_line(&mut line)?;
+            let bytes_read = self.read_line(&mut line, body.len())?;
             if bytes_read == 0 {
                 return Err(FtpError::ConnectionError(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -169,11 +169,25 @@ where
     }
 
     /// Reads bytes from the control connection until `\n` or EOF is found.
-    pub(super) fn read_line(&mut self, line: &mut Vec<u8>) -> FtpResult<usize> {
-        self.reader
-            .read_until(0x0A, line.as_mut())
+    ///
+    /// `reply_len` is the number of bytes of the same reply read before this line; together they
+    /// may not exceed [`MAX_REPLY_SIZE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplyTooLarge`] as a [`FtpError::ConnectionError`] once the reply exceeds
+    /// [`MAX_REPLY_SIZE`], without reading further.
+    pub(super) fn read_line(&mut self, line: &mut Vec<u8>, reply_len: usize) -> FtpResult<usize> {
+        // One byte past the limit tells a reply that exceeds it from one that just fits.
+        let room = MAX_REPLY_SIZE.saturating_sub(reply_len + line.len()) as u64 + 1;
+        let bytes_read = (&mut self.reader)
+            .take(room)
+            .read_until(b'\n', line)
             .map_err(FtpError::ConnectionError)?;
-        Ok(line.len())
+        if reply_len + line.len() > MAX_REPLY_SIZE {
+            return Err(ReplyTooLarge.into());
+        }
+        Ok(bytes_read)
     }
 
     /// Fails with [`FtpError::DataConnectionAlreadyOpen`] if a data connection is open.
@@ -315,5 +329,48 @@ mod tls_transition_tests {
             drop(transfer_control);
             assert_eq!(server.join().unwrap(), "");
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_size_tests {
+    use crate::FtpStream;
+    use crate::types::reply_size_fixture::{assert_reply_too_large, greeting_of_max_size, serve};
+
+    #[test]
+    fn should_accept_a_reply_of_exactly_the_limit() {
+        let address = serve(greeting_of_max_size(), None, Vec::new());
+        assert!(FtpStream::connect(address).is_ok());
+    }
+
+    #[test]
+    fn should_reject_a_reply_one_byte_over_the_limit() {
+        let mut greeting = greeting_of_max_size();
+        greeting.insert(4, b'a');
+        let address = serve(greeting, None, Vec::new());
+        assert_reply_too_large(FtpStream::connect(address).map(|_| ()));
+    }
+
+    #[test]
+    fn should_reject_an_endless_greeting_line() {
+        let address = serve(b"220 ".to_vec(), None, b"a".repeat(4096));
+        assert_reply_too_large(FtpStream::connect(address).map(|_| ()));
+    }
+
+    #[test]
+    fn should_reject_an_endless_multiline_greeting() {
+        let address = serve(b"220-welcome\r\n".to_vec(), None, b" hi\r\n".repeat(1024));
+        assert_reply_too_large(FtpStream::connect(address).map(|_| ()));
+    }
+
+    #[test]
+    fn should_reject_an_endless_feat_reply() {
+        let address = serve(
+            b"220 ready\r\n".to_vec(),
+            Some(b"211-Features\r\n"),
+            b" UTF8\r\n".repeat(1024),
+        );
+        let mut ftp = FtpStream::connect(address).unwrap();
+        assert_reply_too_large(ftp.feat().map(|_| ()));
     }
 }

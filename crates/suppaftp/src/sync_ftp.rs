@@ -803,9 +803,11 @@ where
 
         let first_line = String::from_utf8_lossy(&response.body);
         let mut feat_lines = vec![first_line.to_string()];
+        let mut reply_len = response.body.len();
         loop {
             let mut line = Vec::new();
-            let line_sz = cc.read_line(&mut line)?;
+            let line_sz = cc.read_line(&mut line, reply_len)?;
+            reply_len += line_sz;
             if line_sz == 0 {
                 // EOF reached
                 break;

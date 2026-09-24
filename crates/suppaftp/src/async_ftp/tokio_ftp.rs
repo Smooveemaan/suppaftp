@@ -814,10 +814,12 @@ where
         let first_line = String::from_utf8_lossy(&response.body);
         debug!("FEAT response: {}", first_line);
         let mut feat_lines = vec![first_line.to_string()];
+        let mut reply_len = response.body.len();
 
         loop {
             let mut line = Vec::new();
-            let bytes_read = cc.read_line(&mut line).await?;
+            let bytes_read = cc.read_line(&mut line, reply_len).await?;
+            reply_len += bytes_read;
             if bytes_read == 0 {
                 break;
             }
