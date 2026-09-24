@@ -112,6 +112,96 @@ impl Response {
     }
 }
 
+/// Most bytes one control-connection reply may take, every line of a multiline reply included.
+///
+/// Legitimate replies stay far below it; the largest ones in practice are `FEAT` lists and
+/// multiline welcome banners of a few KiB.
+pub(crate) const MAX_REPLY_SIZE: usize = 256 * 1024;
+
+/// The error inside [`FtpError::ConnectionError`], with [`std::io::ErrorKind::InvalidData`],
+/// when the server sends a control-connection reply larger than 256 KiB.
+///
+/// Without a bound, a server answering with an endless line or an endless multiline reply
+/// (including the greeting, before any authentication) would make the client buffer it without
+/// limit. The reply is abandoned half-read, so the connection cannot be used afterwards.
+///
+/// ```rust
+/// use suppaftp::{FtpError, ReplyTooLarge};
+///
+/// fn is_reply_too_large(err: &FtpError) -> bool {
+///     matches!(err, FtpError::ConnectionError(io)
+///         if io.get_ref().is_some_and(|inner| inner.is::<ReplyTooLarge>()))
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("the server sent a reply larger than {} bytes", MAX_REPLY_SIZE)]
+pub struct ReplyTooLarge;
+
+impl From<ReplyTooLarge> for FtpError {
+    fn from(err: ReplyTooLarge) -> Self {
+        FtpError::ConnectionError(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+    }
+}
+
+/// A fake server shared by the reply size tests of every client.
+#[cfg(test)]
+pub(crate) mod reply_size_fixture {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::thread;
+
+    use super::{FtpError, MAX_REPLY_SIZE, ReplyTooLarge};
+
+    /// Starts a one-connection server that sends `greeting`, then, when `command_reply` is set,
+    /// reads one command and sends `command_reply`. After that it repeats `endless` until the
+    /// client hangs up, or just waits for the client to hang up when `endless` is empty.
+    pub(crate) fn serve(
+        greeting: Vec<u8>,
+        command_reply: Option<&'static [u8]>,
+        endless: Vec<u8>,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(socket);
+            let _ = reader.get_mut().write_all(&greeting);
+            if let Some(reply) = command_reply {
+                let _ = reader.read_line(&mut String::new());
+                let _ = reader.get_mut().write_all(reply);
+            }
+            if endless.is_empty() {
+                let _ = reader.read_to_end(&mut Vec::new());
+            } else {
+                while reader.get_mut().write_all(&endless).is_ok() {}
+            }
+        });
+        address
+    }
+
+    /// A greeting of exactly [`MAX_REPLY_SIZE`] bytes.
+    pub(crate) fn greeting_of_max_size() -> Vec<u8> {
+        let last = b"220 ready\r\n";
+        let mut greeting = b"220-".to_vec();
+        greeting.resize(MAX_REPLY_SIZE - last.len() - 2, b'a');
+        greeting.extend_from_slice(b"\r\n");
+        greeting.extend_from_slice(last);
+        assert_eq!(greeting.len(), MAX_REPLY_SIZE);
+        greeting
+    }
+
+    /// Panics unless `result` failed with [`ReplyTooLarge`].
+    pub(crate) fn assert_reply_too_large(result: Result<(), FtpError>) {
+        match result {
+            Err(FtpError::ConnectionError(err))
+                if err
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<ReplyTooLarge>()) => {}
+            other => panic!("expected ReplyTooLarge, got {other:?}"),
+        }
+    }
+}
+
 impl fmt::Display for FormatControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

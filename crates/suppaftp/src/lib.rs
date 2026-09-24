@@ -225,7 +225,7 @@ use sync_ftp::NoTlsStream;
 #[doc(inline)]
 pub use sync_ftp::TlsConnector;
 pub use sync_ftp::{ImplFtpStream, PassiveStreamBuilder, TlsStream};
-pub use types::{FtpError, FtpResult, Mode};
+pub use types::{FtpError, FtpResult, Mode, ReplyTooLarge};
 pub type FtpStream = ImplFtpStream<NoTlsStream>;
 // -- export secure (native-tls)
 #[cfg(feature = "native-tls")]
