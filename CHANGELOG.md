@@ -2,15 +2,54 @@
 
 All notable changes to this project are documented in this file.
 
+## 12.1.0
+
+Released on 2026-09-25
+
+### Fixed
+
+- bound the size of control-connection replies (#179)
+
+> The reply reader used `read_until` without a byte limit, and a multiline
+> reply was gathered until its terminal line, so a server could make the
+> client buffer without bound, starting with the greeting before any
+> authentication. The same held for the continuation lines `feat` reads.
+>
+> A reply may now take at most 256 KiB, every line included. Past that,
+> the sync, tokio and smol clients fail with `FtpError::ConnectionError`
+> holding the new public `ReplyTooLarge`, without reading further. The
+> async readers keep their cancellation safety: bytes already held from a
+> cancelled read count toward the same bound.
+
+- accept active-mode data connections only from the server (#181)
+
+> In active mode the client listened for the data connection and took
+> whichever one arrived first, only logging its address. Anyone able to
+> reach the listener could connect before the server and hand the client
+> a forged listing or download, or receive an upload meant for the server.
+>
+> The sync, tokio and smol clients now accept the data connection only
+> from an address allowed by `ActivePeerCheck`. The default,
+> `ControlPeer`, accepts only the server on the control connection.
+> `Any` accepts every address, as before this check existed. `Allow`
+> accepts a list of addresses, for servers behind NAT that connect back
+> from another address, or control connections that go through a relay.
+>
+> Call `set_active_peer_check` to change the default.
+
 ## 12.0.1
 
 Released on 2026-09-18
 
 ### Fixed
 
-- expose TLS connector traits
+- expose TLS connector traits (#177)
 
+> - fix: expose TLS connector traits
+>
 > Allow downstream users to implement custom TLS connectors for synchronous, Tokio, and smol clients. Add compile tests covering the public stream types and into_secure bounds.
+>
+> - chore: release 12.0.1
 
 ## 12.0.0
 
