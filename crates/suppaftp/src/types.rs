@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::convert::From;
 use std::fmt;
+use std::net::IpAddr;
 use std::string::FromUtf8Error;
 
 use thiserror::Error;
@@ -84,6 +85,36 @@ pub enum Mode {
     /// Required by some servers (ipv6); defined in rfc 2428 <https://www.rfc-editor.org/rfc/rfc2428#section-3>
     ExtendedPassive,
     Passive,
+}
+
+/// Which addresses an active-mode data connection is accepted from.
+///
+/// In active mode the client listens for the server to connect back, and anyone who can reach
+/// the listener may connect first. Connections from addresses that are not allowed are ignored
+/// until an allowed one arrives or the active timeout expires. Addresses are compared after
+/// [`IpAddr::to_canonical`], so an IPv4-mapped IPv6 address matches its IPv4 form.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum ActivePeerCheck {
+    /// Accept only the address of the server on the control connection.
+    #[default]
+    ControlPeer,
+    /// Accept any address, as before this check existed.
+    Any,
+    /// Accept only the addresses on the list, e.g. when the server connects back from another
+    /// address behind NAT, or the control connection goes through a relay or proxy.
+    Allow(Vec<IpAddr>),
+}
+
+impl ActivePeerCheck {
+    /// Whether a data connection from `peer` is accepted, given the control connection's peer.
+    pub(crate) fn allows(&self, peer: IpAddr, control_peer: IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        match self {
+            Self::ControlPeer => peer == control_peer.to_canonical(),
+            Self::Any => true,
+            Self::Allow(allowed) => allowed.iter().any(|ip| ip.to_canonical() == peer),
+        }
+    }
 }
 
 /// Features returned by FEAT command (key, maybe value)
@@ -237,6 +268,25 @@ mod test {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn should_check_active_peers() {
+        let server: IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let other: IpAddr = "192.0.2.2".parse().unwrap();
+
+        assert!(ActivePeerCheck::ControlPeer.allows(server, server));
+        assert!(ActivePeerCheck::ControlPeer.allows(mapped, server));
+        assert!(ActivePeerCheck::ControlPeer.allows(server, mapped));
+        assert!(!ActivePeerCheck::ControlPeer.allows(other, server));
+
+        assert!(ActivePeerCheck::Any.allows(other, server));
+
+        let allow = ActivePeerCheck::Allow(vec![other]);
+        assert!(allow.allows(other, server));
+        assert!(!allow.allows(server, server));
+        assert!(!ActivePeerCheck::Allow(Vec::new()).allows(server, server));
+    }
 
     #[test]
     fn fmt_error() {
