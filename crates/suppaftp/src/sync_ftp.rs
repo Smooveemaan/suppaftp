@@ -30,7 +30,7 @@ pub use transfer_stream::TransferStream;
 
 use super::Status;
 use super::regex::{EPSV_PORT_RE, MDTM_RE, PASV_PORT_RE, SIZE_RE};
-use super::types::{FileType, FtpError, FtpResult, Mode, Response};
+use super::types::{ActivePeerCheck, FileType, FtpError, FtpResult, Mode, Response};
 use crate::command::Command;
 #[cfg(feature = "secure")]
 use crate::command::ProtectionLevel;
@@ -54,6 +54,8 @@ where
     control: SharedControl<T>,
     mode: Mode,
     nat_workaround: bool,
+    /// Which addresses an active-mode data connection is accepted from.
+    active_peer_check: ActivePeerCheck,
     welcome_msg: Option<String>,
     active_timeout: Duration,
     passive_stream_builder: Box<PassiveStreamBuilder>,
@@ -92,6 +94,7 @@ where
             control: ControlChannel::shared(DataStream::Tcp(stream)),
             mode: Mode::Passive,
             nat_workaround: false,
+            active_peer_check: ActivePeerCheck::default(),
             welcome_msg: None,
             active_timeout: Duration::from_secs(60),
             passive_stream_builder: Self::default_passive_stream_builder(),
@@ -145,6 +148,14 @@ where
         self.nat_workaround = nat_workaround;
     }
 
+    /// Set which addresses an active-mode data connection is accepted from.
+    ///
+    /// The default, [`ActivePeerCheck::ControlPeer`], accepts only the server on the control
+    /// connection; see [`ActivePeerCheck`] for the other choices.
+    pub fn set_active_peer_check(&mut self, check: ActivePeerCheck) {
+        self.active_peer_check = check;
+    }
+
     /// Switch to explicit secure mode if possible (FTPS), using a provided SSL configuration.
     /// Returns [`FtpError::DataConnectionAlreadyOpen`] before sending `AUTH` if a transfer is alive.
     /// This method does nothing if the connect is already secured.
@@ -193,6 +204,7 @@ where
             control: ControlChannel::shared(DataStream::Ssl(Box::new(stream))),
             mode: self.mode,
             nat_workaround: self.nat_workaround,
+            active_peer_check: self.active_peer_check,
             passive_stream_builder: self.passive_stream_builder,
             tls_ctx: Some(Box::new(tls_connector)),
             domain: Some(String::from(domain)),
@@ -247,6 +259,7 @@ where
             control: ControlChannel::shared(DataStream::Ssl(Box::new(stream))),
             mode: Mode::Passive,
             nat_workaround: false,
+            active_peer_check: ActivePeerCheck::default(),
             tls_ctx: Some(Box::new(tls_connector)),
             passive_stream_builder: Self::default_passive_stream_builder(),
             domain: Some(String::from(domain)),
@@ -956,10 +969,21 @@ where
             Mode::Active => {
                 let listener = self.active(cc)?;
                 cc.perform(cmd)?;
+                // Anyone reaching the listener may connect first; only allowed peers are taken.
+                let control_peer = cc
+                    .socket()
+                    .peer_addr()
+                    .map_err(FtpError::ConnectionError)?
+                    .ip();
                 let start = Instant::now();
                 loop {
                     match listener.accept() {
-                        Ok((stream, _)) => break stream,
+                        Ok((stream, addr))
+                            if self.active_peer_check.allows(addr.ip(), control_peer) =>
+                        {
+                            break stream;
+                        }
+                        Ok((_, addr)) => warn!("Ignoring data connection from unexpected {addr}"),
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             if start.elapsed() > self.active_timeout {
                                 return Err(FtpError::ConnectionError(
@@ -2218,5 +2242,34 @@ mod test {
         assert!(stream.quit().is_ok());
         let seen = handle.join().expect("server thread panicked");
         assert_eq!(seen, vec!["QUIT".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod active_peer_tests {
+    use std::time::Duration;
+
+    use crate::active_mode_fixture::serve_active_nlst;
+    use crate::{ActivePeerCheck, FtpStream};
+
+    #[test]
+    fn should_accept_data_connections_only_from_allowed_peers() {
+        // The fixture always connects back from 127.0.0.1, which is also the control peer.
+        let localhost = "127.0.0.1".parse().unwrap();
+        let elsewhere = "192.0.2.1".parse().unwrap();
+        for (check, accepted) in [
+            (ActivePeerCheck::ControlPeer, true),
+            (ActivePeerCheck::Any, true),
+            (ActivePeerCheck::Allow(vec![elsewhere, localhost]), true),
+            (ActivePeerCheck::Allow(vec![elsewhere]), false),
+        ] {
+            let address = serve_active_nlst();
+            let mut ftp = FtpStream::connect(address)
+                .unwrap()
+                .active_mode(Duration::from_secs(1));
+            ftp.set_active_peer_check(check.clone());
+            let listing = ftp.nlst(None);
+            assert_eq!(listing.is_ok(), accepted, "{check:?}: {listing:?}");
+        }
     }
 }

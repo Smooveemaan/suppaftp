@@ -225,7 +225,7 @@ use sync_ftp::NoTlsStream;
 #[doc(inline)]
 pub use sync_ftp::TlsConnector;
 pub use sync_ftp::{ImplFtpStream, PassiveStreamBuilder, TlsStream};
-pub use types::{FtpError, FtpResult, Mode, ReplyTooLarge};
+pub use types::{ActivePeerCheck, FtpError, FtpResult, Mode, ReplyTooLarge};
 pub type FtpStream = ImplFtpStream<NoTlsStream>;
 // -- export secure (native-tls)
 #[cfg(feature = "native-tls")]
@@ -274,4 +274,50 @@ pub fn log_init() {
             .is_test(true)
             .try_init();
     });
+}
+
+/// A fake server for the active-mode data connection tests of every client.
+#[cfg(test)]
+pub(crate) mod active_mode_fixture {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::thread;
+
+    /// Starts a one-connection server that answers `PORT` and, on `NLST`, connects back from
+    /// 127.0.0.1 to the port the client sent and lists a single file, `listed`.
+    pub(crate) fn serve_active_nlst() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(socket);
+            let _ = reader.get_mut().write_all(b"220 ready\r\n");
+            let mut data_port = 0;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let reply: &[u8] = if let Some(args) = line.strip_prefix("PORT ") {
+                    let numbers: Vec<u16> = args
+                        .trim_end()
+                        .split(',')
+                        .map(|n| n.parse().unwrap())
+                        .collect();
+                    data_port = numbers[4] * 256 + numbers[5];
+                    b"200 ok\r\n"
+                } else if line.starts_with("NLST") {
+                    if let Ok(mut data) = TcpStream::connect(("127.0.0.1", data_port)) {
+                        let _ = reader.get_mut().write_all(b"150 here it comes\r\n");
+                        let _ = data.write_all(b"listed\r\n");
+                    }
+                    b"226 done\r\n"
+                } else {
+                    b"502 not here\r\n"
+                };
+                if reader.get_mut().write_all(reply).is_err() {
+                    break;
+                }
+                line.clear();
+            }
+        });
+        address
+    }
 }
